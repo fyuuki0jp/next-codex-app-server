@@ -1,8 +1,99 @@
 import { CodexAppServer } from "@/infrastructure/codex";
+import type {
+  ToolRequestUserInputParams,
+  ToolRequestUserInputResponse,
+  ToolRequestUserInputAnswer,
+} from "@/infrastructure/codex/schemas/v2";
+
+// Workflow todo JSON Schema for structured output
+const WORKFLOW_TODO_SCHEMA = {
+  type: "object",
+  properties: {
+    title: {
+      type: "string",
+      description: "Title of the workflow",
+    },
+    description: {
+      type: "string",
+      description: "Brief description of the overall workflow goal",
+    },
+    tasks: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: {
+            type: "string",
+            description: "Unique identifier for the task",
+          },
+          executor: {
+            type: "string",
+            enum: ["AI", "HUMAN"],
+            description: "Who executes this task: AI or HUMAN",
+          },
+          description: {
+            type: "string",
+            description: "Description of the task",
+          },
+          output: {
+            type: "array",
+            items: { type: "string" },
+            description: "Artifacts/deliverables this task produces",
+          },
+          depends: {
+            type: "array",
+            items: { type: "string" },
+            description: "Task IDs this task depends on",
+          },
+        },
+        required: ["id", "executor", "description"],
+      },
+    },
+  },
+  required: ["title", "tasks"],
+};
+
+// Developer instructions for workflow creation
+const WORKFLOW_TODO_INSTRUCTIONS = `
+## Workflow Task Creation
+
+You are a workflow planning assistant. Your goal is to create a structured workflow with tasks that can be executed by either AI or HUMAN.
+
+### Process
+1. Use request_user_input to ask clarifying questions about the workflow requirements
+2. Based on user responses, create a comprehensive workflow plan
+3. Output the final workflow as structured JSON
+
+### Task Assignment Rules
+- **AI tasks**: Document creation, data analysis, code generation, research, calculations, formatting
+- **HUMAN tasks**: Meetings, phone calls, physical actions, approvals, signatures, external communications, decisions requiring human judgment
+
+### Important
+- Each HUMAN task should clearly specify what artifacts/information the human needs to provide
+- Use task IDs in the "depends" field to indicate dependencies between tasks
+- Ask questions via request_user_input if requirements are unclear
+`;
 
 // Global state for the Codex instance and current thread
 let codexInstance: CodexAppServer | null = null;
 let currentThreadId: string | null = null;
+
+// Pending user input requests - maps itemId to resolve/reject functions
+interface PendingUserInput {
+  resolve: (response: ToolRequestUserInputResponse) => void;
+  reject: (error: Error) => void;
+  params: ToolRequestUserInputParams;
+}
+export const pendingUserInputs = new Map<string, PendingUserInput>();
+
+// Current SSE send function for forwarding requests to frontend
+let currentSendEvent: ((event: string, data: unknown) => void) | null = null;
+
+export function setCurrentSendEvent(
+  sendEvent: ((event: string, data: unknown) => void) | null,
+) {
+  currentSendEvent = sendEvent;
+}
 
 async function getCodex(): Promise<CodexAppServer> {
   if (!codexInstance) {
@@ -18,13 +109,46 @@ async function getCodex(): Promise<CodexAppServer> {
       async () => ({ decision: "accept" as const }),
     );
 
+    // Register user input request handler
+    codexInstance.onServerRequest(
+      "item/tool/requestUserInput",
+      async (
+        params: ToolRequestUserInputParams,
+      ): Promise<ToolRequestUserInputResponse> => {
+        // Forward the request to the frontend via SSE
+        if (currentSendEvent) {
+          currentSendEvent("user_input_request", params);
+        }
+
+        // Wait for user response
+        return new Promise((resolve, reject) => {
+          pendingUserInputs.set(params.itemId, {
+            resolve,
+            reject,
+            params,
+          });
+
+          // Timeout after 5 minutes
+          setTimeout(
+            () => {
+              if (pendingUserInputs.has(params.itemId)) {
+                pendingUserInputs.delete(params.itemId);
+                reject(new Error("User input request timed out"));
+              }
+            },
+            5 * 60 * 1000,
+          );
+        });
+      },
+    );
+
     await codexInstance.initialize(
       {
         name: "next-codex-chat",
         version: "0.1.0",
         title: "Next.js Codex Chat",
       },
-      { experimentalApi: false },
+      { experimentalApi: true },
     );
   }
   return codexInstance;
@@ -57,6 +181,9 @@ export async function POST(request: Request) {
           encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
         );
       };
+
+      // Set current send event for user input requests
+      setCurrentSendEvent(sendEvent);
 
       // Set up event listeners
       const unsubscribers: (() => void)[] = [];
@@ -105,6 +232,45 @@ export async function POST(request: Request) {
         }),
       );
 
+      // Plan updated notification (workflow todo - legacy)
+      unsubscribers.push(
+        codex.onNotification("turn/plan/updated", (params) => {
+          const p = params as {
+            threadId: string;
+            turnId: string;
+            explanation: string | null;
+            plan: Array<{ step: string; status: string }>;
+          };
+          sendEvent("plan_updated", {
+            explanation: p.explanation,
+            plan: p.plan,
+          });
+        }),
+      );
+
+      // Item completed notification - check for structured workflow output
+      unsubscribers.push(
+        codex.onNotification("item/completed", (params) => {
+          const p = params as {
+            item: { type: string; text?: string };
+            threadId: string;
+            turnId: string;
+          };
+          // Check if this is an agentMessage with structured workflow output
+          if (p.item.type === "agentMessage" && p.item.text) {
+            try {
+              const parsed = JSON.parse(p.item.text);
+              // Check if it matches our workflow schema
+              if (parsed.tasks && Array.isArray(parsed.tasks)) {
+                sendEvent("workflow_output", parsed);
+              }
+            } catch {
+              // Not JSON, ignore
+            }
+          }
+        }),
+      );
+
       // Turn completed (v2 notification)
       unsubscribers.push(
         codex.onNotification("turn/completed", (params) => {
@@ -138,12 +304,24 @@ export async function POST(request: Request) {
         for (const unsubscribe of unsubscribers) {
           unsubscribe();
         }
+        // Clear the send event reference
+        setCurrentSendEvent(null);
       };
 
       try {
-        // Start the turn
+        // Start the turn with plan mode, structured output, and user input support
         if (currentThreadId) {
-          await codex.sendMessage(currentThreadId, message);
+          await codex.sendMessage(currentThreadId, message, {
+            collaborationMode: {
+              mode: "plan",
+              settings: {
+                model: "codex-mini-latest",
+                reasoning_effort: null,
+                developer_instructions: WORKFLOW_TODO_INSTRUCTIONS,
+              },
+            },
+            outputSchema: WORKFLOW_TODO_SCHEMA,
+          });
         }
       } catch (error) {
         sendEvent("error", {

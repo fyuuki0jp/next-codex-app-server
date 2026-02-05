@@ -1,6 +1,33 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
+import { UserInputPrompt } from "./UserInputPrompt";
+import {
+  WorkflowTodo,
+  StructuredWorkflowDisplay,
+  type StructuredWorkflow,
+} from "./WorkflowTodo";
+
+interface UserInputOption {
+  label: string;
+  description: string;
+}
+
+interface UserInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  isOther: boolean;
+  isSecret: boolean;
+  options: UserInputOption[] | null;
+}
+
+interface UserInputRequest {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  questions: UserInputQuestion[];
+}
 
 interface Message {
   id: string;
@@ -21,6 +48,11 @@ interface FileChange {
   status: "pending" | "complete";
 }
 
+interface WorkflowPlan {
+  explanation: string | null;
+  plan: Array<{ step: string; status: "pending" | "inProgress" | "completed" }>;
+}
+
 export function Chat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -32,6 +64,11 @@ export function Chat() {
   const [currentFileChanges, setCurrentFileChanges] = useState<FileChange[]>(
     [],
   );
+  const [userInputRequest, setUserInputRequest] =
+    useState<UserInputRequest | null>(null);
+  const [workflowPlan, setWorkflowPlan] = useState<WorkflowPlan | null>(null);
+  const [structuredWorkflow, setStructuredWorkflow] =
+    useState<StructuredWorkflow | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = useCallback(() => {
@@ -104,6 +141,9 @@ export function Chat() {
                 },
                 setCurrentCommands,
                 setCurrentFileChanges,
+                setUserInputRequest,
+                setWorkflowPlan,
+                setStructuredWorkflow,
               );
             } catch {
               // Ignore parse errors
@@ -147,10 +187,68 @@ export function Chat() {
     setStreamingContent("");
     setCurrentCommands([]);
     setCurrentFileChanges([]);
+    setUserInputRequest(null);
+    setWorkflowPlan(null);
+    setStructuredWorkflow(null);
+  };
+
+  const handleUserInputSubmit = async (answers: {
+    [key: string]: { answers: string[] };
+  }) => {
+    if (!userInputRequest) return;
+
+    try {
+      const response = await fetch("/api/chat/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: userInputRequest.itemId,
+          answers,
+        }),
+      });
+
+      if (!response.ok) {
+        console.error("Failed to submit user input");
+      }
+    } catch (error) {
+      console.error("Error submitting user input:", error);
+    } finally {
+      setUserInputRequest(null);
+    }
+  };
+
+  const handleUserInputCancel = async () => {
+    if (!userInputRequest) return;
+
+    // Submit empty answers to cancel
+    try {
+      await fetch("/api/chat/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: userInputRequest.itemId,
+          answers: {},
+        }),
+      });
+    } catch (error) {
+      console.error("Error cancelling user input:", error);
+    } finally {
+      setUserInputRequest(null);
+    }
   };
 
   return (
     <div className="flex h-screen flex-col bg-zinc-900">
+      {/* User Input Prompt Modal */}
+      {userInputRequest && (
+        <UserInputPrompt
+          itemId={userInputRequest.itemId}
+          questions={userInputRequest.questions}
+          onSubmit={handleUserInputSubmit}
+          onCancel={handleUserInputCancel}
+        />
+      )}
+
       {/* Header */}
       <header className="flex items-center justify-between border-b border-zinc-800 px-6 py-4">
         <h1 className="text-xl font-semibold text-white">Codex Chat</h1>
@@ -177,6 +275,21 @@ export function Chat() {
               </p>
             </div>
           )}
+
+          {/* Structured Workflow (from outputSchema) */}
+          {structuredWorkflow && (
+            <StructuredWorkflowDisplay workflow={structuredWorkflow} />
+          )}
+
+          {/* Legacy Workflow Todo Panel (from turn/plan/updated) */}
+          {!structuredWorkflow &&
+            workflowPlan &&
+            workflowPlan.plan.length > 0 && (
+              <WorkflowTodo
+                explanation={workflowPlan.explanation}
+                plan={workflowPlan.plan}
+              />
+            )}
 
           {messages.map((message) => (
             <MessageBubble key={message.id} message={message} />
@@ -345,7 +458,35 @@ function handleEvent(
   setContent: (content: string) => void,
   setCommands: React.Dispatch<React.SetStateAction<CommandExecution[]>>,
   setFileChanges: React.Dispatch<React.SetStateAction<FileChange[]>>,
+  setUserInputRequest: React.Dispatch<
+    React.SetStateAction<UserInputRequest | null>
+  >,
+  setWorkflowPlan: React.Dispatch<React.SetStateAction<WorkflowPlan | null>>,
+  setStructuredWorkflow: React.Dispatch<
+    React.SetStateAction<StructuredWorkflow | null>
+  >,
 ) {
+  // Handle user input request events
+  if ("questions" in data && "itemId" in data) {
+    setUserInputRequest(data as unknown as UserInputRequest);
+    return;
+  }
+
+  // Handle structured workflow output (from outputSchema)
+  if ("tasks" in data && Array.isArray(data.tasks) && "title" in data) {
+    setStructuredWorkflow(data as unknown as StructuredWorkflow);
+    return;
+  }
+
+  // Handle plan updated events (legacy workflow todo)
+  if ("plan" in data && Array.isArray(data.plan) && !("tasks" in data)) {
+    setWorkflowPlan({
+      explanation: (data.explanation as string) || null,
+      plan: data.plan as WorkflowPlan["plan"],
+    });
+    return;
+  }
+
   // Handle delta events (streaming text)
   if ("text" in data && typeof data.text === "string") {
     setContent(currentContent + data.text);
